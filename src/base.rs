@@ -118,7 +118,7 @@ pub(crate) fn codegen_fn<'tcx>(
         None
     };
 
-    let mut fx = FunctionCx {
+    let mut fx: FunctionCx<'_, '_, '_> = FunctionCx {
         cx,
         module,
         tcx,
