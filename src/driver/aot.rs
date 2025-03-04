@@ -531,7 +531,7 @@ fn codegen_cgu_content(
                     module,
                     inst,
                 ) {
-                    codegened_functions.push(codegened_function);
+                    codegened_functions.extend(codegened_function);
                 }
             }
             MonoItem::Static(def_id) => {

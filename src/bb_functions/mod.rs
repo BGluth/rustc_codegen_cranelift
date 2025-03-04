@@ -8,4 +8,5 @@
 //! - Reconstruct all BB statements to refer to the function argument instead of the original variable (hard??).
 //!
 
-mod bb_read_write_scan;
+pub(crate) mod bb_read_write_scan;
+pub(crate) mod yanked_code;

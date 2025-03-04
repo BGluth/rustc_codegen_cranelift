@@ -15,6 +15,8 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::layout::{FnAbiOf, HasTypingEnv};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 
+use crate::bb_functions::bb_read_write_scan::create_funcs_from_func_bbs;
+use crate::bb_functions::yanked_code::fn_abi_new_uncached;
 use crate::constant::ConstantCx;
 use crate::debuginfo::{FunctionDebugContext, TypeDebugContext};
 use crate::enable_verifier;
@@ -32,12 +34,12 @@ pub(crate) struct CodegenedFunction {
 
 pub(crate) fn codegen_fn<'tcx>(
     tcx: TyCtxt<'tcx>,
-    cx: &mut crate::CodegenCx,
+    cx: &'tcx mut crate::CodegenCx,
     type_dbg: &mut TypeDebugContext<'tcx>,
     cached_func: Function,
-    module: &mut dyn Module,
+    module: &'tcx mut dyn Module,
     instance: Instance<'tcx>,
-) -> Option<CodegenedFunction> {
+) -> Option<Vec<CodegenedFunction>> {
     debug_assert!(!instance.args.has_infer());
 
     let symbol_name = tcx.symbol_name(instance).name.to_string();
@@ -92,81 +94,127 @@ pub(crate) fn codegen_fn<'tcx>(
 
     // Make the FunctionBuilder
     let mut func_ctx = FunctionBuilderContext::new();
-    let mut func = cached_func;
-    func.clear();
-    func.name = UserFuncName::user(0, func_id.as_u32());
-    func.signature = sig;
-    func.collect_debug_info();
-
-    let mut bcx = FunctionBuilder::new(&mut func, &mut func_ctx);
+    // let mut func = cached_func;
+    // func.clear();
+    // func.name = UserFuncName::user(0, func_id.as_u32());
+    // func.signature = sig;
+    // func.collect_debug_info();
 
     // Predefine blocks
-    let start_block = bcx.create_block();
-    let block_map: IndexVec<BasicBlock, Block> =
-        (0..mir.basic_blocks.len()).map(|_| bcx.create_block()).collect();
+    // let start_block = bcx.create_block();
+    // let block_map: IndexVec<BasicBlock, Block> =
+    //     (0..mir.basic_blocks.len()).map(|_| bcx.create_block()).collect();
 
-    let fn_abi = FullyMonomorphizedLayoutCx(tcx).fn_abi_of_instance(instance, ty::List::empty());
+    let layout_cx = FullyMonomorphizedLayoutCx(tcx);
+    let fn_abi = layout_cx.fn_abi_of_instance(instance, ty::List::empty());
 
-    // Make FunctionCx
-    let target_config = module.target_config();
-    let pointer_type = target_config.pointer_type();
+    // let func_debug_cx = if let Some(debug_context) = &mut cx.debug_context {
+    //     Some(debug_context.define_function(tcx, type_dbg, instance, fn_abi, &symbol_name, mir.span))
+    // } else {
+    //     None
+    // };
+
+    let bb_to_func_info = create_funcs_from_func_bbs(tcx, mir, &symbol_name);
     let clif_comments = crate::pretty_clif::CommentWriter::new(tcx, instance, fn_abi);
 
-    let func_debug_cx = if let Some(debug_context) = &mut cx.debug_context {
-        Some(debug_context.define_function(tcx, type_dbg, instance, fn_abi, &symbol_name, mir.span))
-    } else {
-        None
-    };
+    let mut bb_funcs = Vec::new();
+    for mut bb_func_info in bb_to_func_info {
+        let mut bcx = FunctionBuilder::new(&mut bb_func_info.func, &mut func_ctx);
+        let start_block = bcx.create_block();
 
-    let mut fx: FunctionCx<'_, '_, '_> = FunctionCx {
-        cx,
-        module,
-        tcx,
-        target_config,
-        pointer_type,
-        constants_cx: ConstantCx::new(),
-        func_debug_cx,
+        let mut block_map = IndexVec::new();
+        block_map.push(bcx.create_block());
 
-        instance,
-        symbol_name,
-        mir,
-        fn_abi,
+        let fn_abi = bb_func_info.bb_args_and_return.create_fn_abi(tcx);
 
-        bcx,
-        block_map,
-        local_map: IndexVec::with_capacity(mir.local_decls.len()),
-        caller_location: None, // set by `codegen_fn_prelude`
+        // Make FunctionCx
+        let target_config = module.target_config();
+        let pointer_type = target_config.pointer_type();
 
-        clif_comments,
-        next_ssa_var: 0,
-    };
+        let mut fx: FunctionCx<'_, '_, '_> = FunctionCx {
+            cx,
+            module,
+            tcx,
+            target_config,
+            pointer_type,
+            constants_cx: ConstantCx::new(),
+            func_debug_cx: None,
 
-    tcx.prof.generic_activity("codegen clif ir").run(|| codegen_fn_body(&mut fx, start_block));
-    fx.bcx.seal_all_blocks();
-    fx.bcx.finalize();
+            // Reuse existing instance. Probably ok?
+            instance,
+            symbol_name: bb_func_info.func_name,
+            mir,
+            fn_abi,
 
-    // Recover all necessary data from fx, before accessing func will prevent future access to it.
-    let symbol_name = fx.symbol_name;
-    let clif_comments = fx.clif_comments;
-    let func_debug_cx = fx.func_debug_cx;
+            bcx,
+            block_map,
+            local_map: IndexVec::new(),
+            caller_location: None, // set by `codegen_fn_prelude`
 
-    fx.constants_cx.finalize(fx.tcx, &mut *fx.module);
+            clif_comments: clif_comments.clone(),
+            next_ssa_var: 0,
+        };
 
-    if cx.should_write_ir {
-        crate::pretty_clif::write_clif_file(
-            tcx.output_filenames(()),
-            &symbol_name,
-            "unopt",
-            module.isa(),
-            &func,
-            &clif_comments,
-        );
+        tcx.prof.generic_activity("codegen clif ir").run(|| codegen_fn_body(&mut fx, start_block));
+        fx.bcx.seal_all_blocks();
+        fx.bcx.finalize();
+
+        // Recover all necessary data from fx, before accessing func will prevent future access to it.
+        let symbol_name = fx.symbol_name;
+        let clif_comments = fx.clif_comments;
+        let func_debug_cx = fx.func_debug_cx;
+
+        fx.constants_cx.finalize(fx.tcx, &mut *fx.module);
+
+        if cx.should_write_ir {
+            crate::pretty_clif::write_clif_file(
+                tcx.output_filenames(()),
+                &symbol_name,
+                "unopt",
+                module.isa(),
+                &bb_func_info.func,
+                &clif_comments,
+            );
+        }
+
+        // Verify function
+        verify_func(tcx, &clif_comments, &bb_func_info.func);
+
+        bb_funcs.push(CodegenedFunction {
+            symbol_name,
+            func_id,
+            func: bb_func_info.func,
+            clif_comments,
+            func_debug_cx,
+        });
     }
 
-    // Verify function
-    verify_func(tcx, &clif_comments, &func);
+    // tcx.prof.generic_activity("codegen clif ir").run(|| codegen_fn_body(&mut fx, start_block));
+    // fx.bcx.seal_all_blocks();
+    // fx.bcx.finalize();
 
-    Some(CodegenedFunction { symbol_name, func_id, func, clif_comments, func_debug_cx })
+    // // Recover all necessary data from fx, before accessing func will prevent future access to it.
+    // let symbol_name = fx.symbol_name;
+    // let clif_comments = fx.clif_comments;
+    // let func_debug_cx = fx.func_debug_cx;
+
+    // fx.constants_cx.finalize(fx.tcx, &mut *fx.module);
+
+    // if cx.should_write_ir {
+    //     crate::pretty_clif::write_clif_file(
+    //         tcx.output_filenames(()),
+    //         &symbol_name,
+    //         "unopt",
+    //         module.isa(),
+    //         &func,
+    //         &clif_comments,
+    //     );
+    // }
+
+    // // Verify function
+    // verify_func(tcx, &clif_comments, &func);
+
+    Some(bb_funcs)
 }
 
 pub(crate) fn compile_fn(

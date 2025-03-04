@@ -212,7 +212,7 @@ pub(crate) fn codegen_and_compile_fn<'tcx>(
             crate::PrintOnPanic(|| format!("{:?} {}", instance, tcx.symbol_name(instance).name));
 
         let cached_func = std::mem::replace(&mut cached_context.func, Function::new());
-        if let Some(codegened_func) = crate::base::codegen_fn(
+        if let Some(codegened_funcs) = crate::base::codegen_fn(
             tcx,
             cx,
             &mut TypeDebugContext::default(),
@@ -220,7 +220,9 @@ pub(crate) fn codegen_and_compile_fn<'tcx>(
             module,
             instance,
         ) {
-            crate::base::compile_fn(cx, &tcx.prof, cached_context, module, codegened_func);
+            for func in codegened_funcs {
+                crate::base::compile_fn(cx, &tcx.prof, cached_context, module, func);
+            }
         }
     });
 }

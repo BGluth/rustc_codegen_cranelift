@@ -28,6 +28,7 @@ extern crate rustc_mir_dataflow;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
+extern crate stable_mir;
 #[macro_use]
 extern crate tracing;
 
